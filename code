@@ -1,0 +1,344 @@
+```dataviewjs
+const CFG = {
+  weeklyNotesFolder: "",
+  weeklyFilenameRegex: /^W\d{1,2}\s+\d{1,2}\.\d{2}-\d{2}$/,
+
+  habits: ["water", "workout", "reading", "study"],
+  weekStart: 1, // 0=Sun ... 6=Sat
+
+  cellSizePx: 12,
+  cellGapPx: 3,
+
+  dayHeadingRegex: /^###\s*(\d{4}-\d{2}-\d{2})\s*$/,
+  inlineFieldRegex: /^([A-Za-z][A-Za-z0-9_-]*)::\s*(-?\d+(?:\.\d+)?)\s*$/,
+
+  todayISO: null,
+
+  // Fallback colors (dark-mode friendly). Used even if CSS snippet is off.
+  // HSL: [hue, sat%, L1..L5]
+  habitHSL: {
+    water:   [210, 80, [28, 34, 40, 48, 56]],
+    workout: [48,  95, [26, 32, 38, 46, 54]],
+    reading: [28,  45, [22, 28, 34, 42, 50]],
+    study:   [270, 55, [24, 30, 36, 44, 52]],
+  },
+
+  tooltip: {
+    offsetX: 12,
+    offsetY: 12,
+    maxWidthPx: 220,
+  },
+};
+
+/********************************************************************
+ * IMPLEMENTATION
+ ********************************************************************/
+const pad2 = (n) => String(n).padStart(2, "0");
+const toISODate = (d) => `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}`;
+const parseISODate = (iso) => { const [y,m,dd]=iso.split("-").map(Number); return new Date(y,m-1,dd); };
+const addDays = (d, n) => { const x=new Date(d); x.setDate(x.getDate()+n); return x; };
+const startOfWeek = (d, weekStart) => {
+  const x = new Date(d.getFullYear(), d.getMonth(), d.getDate());
+  const dow = x.getDay();
+  const diff = (dow - weekStart + 7) % 7;
+  return addDays(x, -diff);
+};
+const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+const monthShort = (d) => ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"][d.getMonth()];
+
+function quantileCutpoints(values) {
+  const v = values.slice().filter((x)=>Number.isFinite(x)).sort((a,b)=>a-b);
+  const n = v.length;
+  if (n === 0) return [NaN,NaN,NaN,NaN];
+  const rank = (p) => v[clamp(Math.ceil(p*n)-1, 0, n-1)];
+  return [rank(0.2), rank(0.4), rank(0.6), rank(0.8)];
+}
+function levelFromCutpoints(x, cuts) {
+  if (!Number.isFinite(x)) return 0;
+  let lvl = 1;
+  for (const c of cuts) if (Number.isFinite(c) && x > c) lvl++;
+  return clamp(lvl, 1, 5);
+}
+
+async function collectWeeklyFiles() {
+  const folder = (CFG.weeklyNotesFolder || "").trim();
+  const pages = dv.pages(folder ? `"${folder}"` : "");
+  const out = [];
+  for (const p of pages) {
+    if (!p?.file?.path || !p?.file?.name) continue;
+    if (!p.file.path.endsWith(".md")) continue;
+    if (!CFG.weeklyFilenameRegex.test(p.file.name)) continue;
+    out.push({ path: p.file.path, name: p.file.name });
+  }
+  return out;
+}
+
+async function parseAllData(files) {
+  const habitSet = new Set(CFG.habits);
+  const dayMap = new Map(); // iso -> {habit:number}
+  for (const f of files) {
+    let txt = "";
+    try { txt = await dv.io.load(f.path); } catch { continue; }
+    if (!txt) continue;
+
+    const lines = txt.split(/\r?\n/);
+    let curDay = null;
+
+    for (const raw of lines) {
+      const line = raw.trimEnd();
+
+      const mDay = line.match(CFG.dayHeadingRegex);
+      if (mDay) {
+        curDay = mDay[1];
+        if (!dayMap.has(curDay)) dayMap.set(curDay, Object.create(null));
+        continue;
+      }
+      if (!curDay) continue;
+
+      const mField = line.trim().match(CFG.inlineFieldRegex);
+      if (!mField) continue;
+
+      const key = mField[1];
+      if (!habitSet.has(key)) continue;
+
+      const val = Number(mField[2]);
+      if (!Number.isFinite(val)) continue;
+
+      dayMap.get(curDay)[key] = val; // last wins
+    }
+  }
+  return dayMap;
+}
+
+function buildRange(dayMap, todayISO) {
+  let minISO = null;
+  for (const iso of dayMap.keys()) if (!minISO || iso < minISO) minISO = iso;
+
+  const today = todayISO ? parseISODate(todayISO) : new Date();
+  const todayIso = toISODate(today);
+  if (!minISO) minISO = todayIso;
+
+  return { start: parseISODate(minISO), end: parseISODate(todayIso) };
+}
+
+function buildGrid(start, end) {
+  const startAligned = startOfWeek(start, CFG.weekStart);
+  let count = 0;
+  for (let d = new Date(startAligned); d <= end; d = addDays(d, 1)) count++;
+  const weeks = Math.ceil(count / 7);
+  return { startAligned, weeks };
+}
+
+/** Tooltip: attach to document.body and use pageX/pageY to avoid theme/zoom drift. */
+function ensureTooltip() {
+  let tip = document.body.querySelector(".hm-tooltip");
+  if (tip) return tip;
+
+  tip = document.createElement("div");
+  tip.className = "hm-tooltip";
+  tip.style.position = "absolute";
+  tip.style.zIndex = "9999";
+  tip.style.pointerEvents = "none";
+  tip.style.display = "none";
+  tip.style.maxWidth = `${CFG.tooltip.maxWidthPx}px`;
+  tip.style.padding = "8px 10px";
+  tip.style.borderRadius = "10px";
+  tip.style.border = "1px solid rgba(255,255,255,0.12)";
+  tip.style.background = "rgba(20,20,24,0.92)";
+  tip.style.backdropFilter = "blur(6px)";
+  tip.style.color = "rgba(255,255,255,0.92)";
+  tip.style.fontSize = "12px";
+  tip.style.lineHeight = "1.25";
+  tip.style.boxShadow = "0 10px 30px rgba(0,0,0,0.35)";
+  document.body.appendChild(tip);
+
+  return tip;
+}
+
+function setTooltipPos(tip, pageX, pageY) {
+  const ox = CFG.tooltip.offsetX;
+  const oy = CFG.tooltip.offsetY;
+
+  // First place near cursor
+  tip.style.left = `${pageX + ox}px`;
+  tip.style.top  = `${pageY + oy}px`;
+
+  // Clamp into viewport
+  const r = tip.getBoundingClientRect();
+  const vw = window.innerWidth;
+  const vh = window.innerHeight;
+
+  let left = r.left;
+  let top = r.top;
+
+  if (r.right > vw - 8) left = Math.max(8, vw - r.width - 8);
+  if (r.bottom > vh - 8) top = Math.max(8, vh - r.height - 8);
+
+  // Convert clamped viewport coords back to page coords
+  tip.style.left = `${left + window.scrollX}px`;
+  tip.style.top  = `${top + window.scrollY}px`;
+}
+
+function colorFor(habit, lvl) {
+  if (lvl < 1 || lvl > 5) return "rgba(255,255,255,0.08)"; // no data grey
+  const spec = CFG.habitHSL[habit];
+  if (!spec) return "rgba(255,255,255,0.08)";
+  const [h, s, Ls] = spec;
+  const L = Ls[lvl - 1];
+  return `hsl(${h} ${s}% ${L}%)`;
+}
+
+function renderHeatmap(rootEl, habit, range, grid, dayMap, cuts) {
+  const { start, end } = range;
+  const { startAligned, weeks } = grid;
+
+  const card = document.createElement("section");
+  card.className = `hm-card hm-habit-${habit}`;
+
+  const title = document.createElement("div");
+  title.className = "hm-title";
+  
+  const TITLE = {
+  water: "Water💧",
+  workout: "Workout🏋️",
+  reading: "Reading📖",
+  study: "Study📒",
+};
+
+title.textContent = TITLE[habit] ?? habit.toUpperCase();
+  card.appendChild(title);
+
+  const legend = document.createElement("div");
+  legend.className = "hm-legend";
+  for (let i = 1; i <= 5; i++) {
+    const b = document.createElement("span");
+    b.className = `hm-legend-box lvl-${i}`;
+    // Fallback visible even without CSS
+    b.style.display = "inline-block";
+    b.style.width = "12px";
+    b.style.height = "12px";
+    b.style.borderRadius = "3px";
+    b.style.border = "1px solid rgba(255,255,255,0.10)";
+    b.style.background = colorFor(habit, i);
+    legend.appendChild(b);
+  }
+  
+  const lt = document.createElement("span");
+  lt.className = "hm-legend-text";
+  lt.textContent = "low → high";
+  lt.style.marginLeft = "6px";
+  legend.appendChild(lt);
+  card.appendChild(legend);
+
+  const scroller = document.createElement("div");
+  scroller.className = "hm-scroller";
+  card.appendChild(scroller);
+
+  const colW = `${CFG.cellSizePx}px`;
+  const gap = `${CFG.cellGapPx}px`;
+
+  const monthRow = document.createElement("div");
+  monthRow.className = "hm-months";
+  monthRow.style.display = "grid";
+  monthRow.style.gridTemplateColumns = `repeat(${weeks}, ${colW})`;
+  monthRow.style.columnGap = gap;
+  scroller.appendChild(monthRow);
+
+  let prevMonth = null;
+  for (let w = 0; w < weeks; w++) {
+    const ws = addDays(startAligned, w * 7);
+    const we = addDays(ws, 6);
+    if (we < start || ws > end) continue;
+
+    const m = ws.getMonth();
+    if (prevMonth === null || m !== prevMonth) {
+      const lab = document.createElement("div");
+      lab.className = "hm-month";
+      lab.textContent = monthShort(ws);
+      lab.style.gridColumn = `${w + 1} / span 1`;
+      monthRow.appendChild(lab);
+      prevMonth = m;
+    }
+  }
+
+  const gridEl = document.createElement("div");
+  gridEl.className = "hm-grid";
+  gridEl.style.display = "grid";
+  gridEl.style.gridTemplateColumns = `repeat(${weeks}, ${colW})`;
+  gridEl.style.gridTemplateRows = `repeat(7, ${colW})`;
+  gridEl.style.gap = gap;
+  scroller.appendChild(gridEl);
+
+  const tip = ensureTooltip();
+
+  for (let w = 0; w < weeks; w++) {
+    for (let i = 0; i < 7; i++) {
+      const date = addDays(startAligned, w * 7 + i);
+      const iso = toISODate(date);
+
+      const cell = document.createElement("div");
+      cell.className = "hm-cell";
+      cell.style.width = colW;
+      cell.style.height = colW;
+      cell.style.borderRadius = "3px";
+      cell.style.border = "1px solid rgba(255,255,255,0.06)";
+      cell.style.gridColumn = String(w + 1);
+      cell.style.gridRow = String(((date.getDay() - CFG.weekStart + 7) % 7) + 1);
+
+      const inRange = (date >= start && date <= end);
+      cell.dataset.inRange = inRange ? "1" : "0";
+
+      let value = null;
+      if (inRange) {
+        const rec = dayMap.get(iso);
+        if (rec && Object.prototype.hasOwnProperty.call(rec, habit)) value = rec[habit];
+      }
+
+      const lvl = (value === null) ? 0 : levelFromCutpoints(value, cuts);
+      cell.dataset.level = String(lvl);
+
+      // Color fallback (still compatible with your CSS mapping)
+      cell.style.background = colorFor(habit, lvl);
+      if (!inRange) cell.style.opacity = "0.25";
+
+      cell.addEventListener("mouseenter", (e) => {
+        tip.innerHTML = `<div style="font-weight:650">${iso}</div><div style="opacity:.75">${value === null ? "no data" : value}</div>`;
+        tip.style.display = "block";
+        setTooltipPos(tip, e.pageX, e.pageY);
+      });
+      cell.addEventListener("mousemove", (e) => setTooltipPos(tip, e.pageX, e.pageY));
+      cell.addEventListener("mouseleave", () => { tip.style.display = "none"; });
+
+      gridEl.appendChild(cell);
+    }
+  }
+
+  rootEl.appendChild(card);
+}
+
+(async () => {
+  const root = dv.el("div", "", { cls: "hm-dashboard" });
+  root.style.display = "grid";
+  root.style.gap = "24px"; // heatmap之间空一行
+
+  const files = await collectWeeklyFiles();
+  const dayMap = await parseAllData(files);
+
+  const range = buildRange(dayMap, CFG.todayISO);
+  const grid = buildGrid(range.start, range.end);
+
+  const cutByHabit = Object.create(null);
+  for (const h of CFG.habits) {
+    const vals = [];
+    for (const rec of dayMap.values()) {
+      if (rec && Object.prototype.hasOwnProperty.call(rec, h)) {
+        const v = rec[h];
+        if (Number.isFinite(v)) vals.push(v);
+      }
+    }
+    cutByHabit[h] = quantileCutpoints(vals);
+  }
+
+  for (const h of CFG.habits) renderHeatmap(root, h, range, grid, dayMap, cutByHabit[h]);
+})();
+```
