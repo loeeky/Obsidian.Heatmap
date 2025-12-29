@@ -1,0 +1,70 @@
+---
+type: weekly
+week: W<% tp.date.now("WW") %>
+start: <% tp.date.now("YYYY-MM-DD") %>
+end: <% tp.date.now("YYYY-MM-DD", 6) %>
+---
+
+# 🗓️ 第 <% tp.date.now("WW") %> 周（Week <% tp.date.now("WW") %>）<% tp.date.now("MM.DD") %> – <% tp.date.now("MM.DD", 6) %>
+
+---
+
+## 🎯 本周重点（Weekly Focus）
+> 这一周真正重要的 1–3 件事
+
+- 
+- 
+- 
+
+---
+
+## 📥 本周收件箱（Weekly Inbox）
+> 所有临时想法、未归类事项、半成品，先放这里
+
+- 
+- 
+- 
+
+---
+
+## 📅 每日记录（Daily Log）
+
+<%*
+for (let i = 0; i < 7; i++) {
+  const d = tp.date.now("YYYY-MM-DD", i);
+
+  tR += `### ${d}
+
+water:: 
+workout:: 
+reading:: 
+study:: 
+
+**Today**
+- 
+
+**Notes**
+- 
+
+---
+
+`;
+}
+%>
+
+## 🧠 本周总结（Weekly Review）
+> 给未来的自己留几句“有用的话”
+
+- 本周最有效的一件事：
+- 最拖后腿的一件事：
+- 一个我没预期但发生了的变化：
+- 下周我会刻意避免什么？
+
+---
+
+## ⏳ 遗留事项（Open Loops）
+> 不清空，只交接
+
+- [ ] 
+- [ ] 
+- [ ] 
